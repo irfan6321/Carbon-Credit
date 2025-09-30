@@ -5,7 +5,7 @@ import os
 import time
 
 # --- Configuration ---
-BACKEND_URL = "https://a1b2-c3d4-e5f6-g7h8.ngrok-free.app" # PASTE YOUR NGROK URL HERE
+BACKEND_URL = "https://egotistic-elouise-nonmythical.ngrok-free.dev" # PASTE YOUR NGROK URL HERE
 
 st.set_page_config(layout="wide")
 st.title("Drone Imagery Carbon Sequestration Platform")
