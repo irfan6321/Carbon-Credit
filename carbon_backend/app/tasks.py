@@ -1,3 +1,4 @@
+# app/tasks.py
 import os
 import shutil
 from celery import Celery
@@ -7,25 +8,27 @@ import rasterio
 from rasterio import features, mask
 import numpy as np
 from scipy import ndimage as ndi
-from skimage.segmentation import watershed
+from skimage.segmentation import watershed,_watershed
 from skimage.feature import peak_local_max
+from skimage.transform import rescale
 import geopandas as gpd
 import pandas as pd
 from shapely.geometry import shape
 from . import database, models
+import time
+import requests
+import zipfile
+import io
 
-# Configure Celery
+# --- Celery Configuration ---
 celery_app = Celery(
     "tasks",
     broker="redis://redis:6379/0",
     backend="redis://redis:6379/0"
 )
+celery_app.conf.update(task_track_started=True)
 
-celery_app.conf.update(
-    task_track_started=True,
-)
-
-# --- HELPER FUNCTIONS ---
+# --- Helper Functions ---
 def get_db():
     return database.SessionLocal()
 
@@ -38,17 +41,29 @@ def update_project_status(db: Session, project_id: int, status: str, data: dict 
                 setattr(project, key, value)
         db.commit()
 
-# --- CELERY TASK CHAIN ---
+# --- Placeholder Scientific & Filter Coefficients ---
+MAX_REALISTIC_TREE_HEIGHT_M = 50.0
+MAX_REALISTIC_CROWN_AREA_SQM = 500.0
+MIN_REALISTIC_TREE_HEIGHT_M = 0.5
+MIN_REALISTIC_CROWN_AREA_SQM = 0.5
+DBH_FROM_HEIGHT_SLOPE = 0.3
+DBH_FROM_HEIGHT_INTERCEPT = 0.1
+WOOD_DENSITY_RHO = 0.65
+ALLOM_COEFF_A = 0.1
+ALLOM_COEFF_B = 2.46
+BGB_TO_AGB_RATIO = 0.5
+CARBON_FRACTION = 0.47
+CO2_CONVERSION_FACTOR = 3.67
+
+# --- Celery Task Chain ---
 @celery_app.task
 def start_processing_pipeline(project_id: int):
-    """The main entry point task that chains all other tasks together."""
     db = get_db()
     update_project_status(db, project_id, "PROCESSING: PHOTOGRAMMETRY")
     db.close()
     
-    # Create a chain of tasks that will execute in order
     pipeline = (
-        simulate_photogrammetry.s(project_id) |
+        run_photogrammetry.s(project_id) |
         generate_chm.s() |
         segment_trees.s() |
         calculate_carbon.s()
@@ -58,31 +73,25 @@ def start_processing_pipeline(project_id: int):
 
 @celery_app.task
 def handle_error(request, exc, traceback, project_id):
-    """Task to handle errors in the pipeline."""
     db = get_db()
     update_project_status(db, project_id, f"FAILED: {str(exc)}")
     db.close()
     print(f"Pipeline failed for project {project_id}: {exc}")
 
-# --- INDIVIDUAL PROCESSING TASKS ---
+# --- Individual Processing Tasks ---
 
-@celery_app.task
-def simulate_photogrammetry(project_id: int) -> dict:
-    """
-    SIMULATED: Copies pre-processed WebODM outputs into the project folder.
-    In a real system, this would interact with the WebODM API.
-    """
-    db = get_db()
-    project = db.query(models.Project).filter(models.Project.id == project_id).first()
-    project_name = project.name
-    db.close()
-
+@celery_app.task(bind=True)
+def run_photogrammetry(self, project_id: int) -> dict:
+    # THIS TASK IS CURRENTLY A SIMULATION FOR PROTOTYPING SPEED
+    # To enable real processing, replace this with the WebODM API version.
+    print(f"[{project_id}] SIMULATING photogrammetry...")
     data_dir = os.getenv("DATA_DIRECTORY")
-    project_dir = os.path.join(data_dir, project_name)
+    
+    # CORRECT: Path is built using the unique project_id
+    project_dir = os.path.join(data_dir, str(project_id))
     sample_dir = os.path.join(data_dir, "sample_odm_outputs")
 
     dsm_path = os.path.join(project_dir, "dsm.tif")
-    
     shutil.copy(os.path.join(sample_dir, "odm_dem.tif"), dsm_path)
     
     db = get_db()
@@ -93,12 +102,13 @@ def simulate_photogrammetry(project_id: int) -> dict:
 
 @celery_app.task
 def generate_chm(previous_task_result: dict) -> dict:
-    """Generates the Canopy Height Model (CHM) from the DSM."""
     project_id = previous_task_result["project_id"]
     dsm_path = previous_task_result["dsm_path"]
-    project_dir = os.path.dirname(dsm_path)
     
-    # Generate DTM
+    # CORRECT: We get the project directory from the path passed by the previous task
+    project_dir = os.path.dirname(dsm_path)
+    print(f"[{project_id}] Generating CHM from DSM at {dsm_path}...")
+    
     dtm_path = os.path.join(project_dir, "dtm.tif")
     low_res_path = os.path.join(project_dir, "dsm_low_res.tif")
 
@@ -108,36 +118,31 @@ def generate_chm(previous_task_result: dict) -> dict:
     gdal.Warp(low_res_path, dsm_path, xRes=5, yRes=5, resampleAlg='near')
     gdal.Warp(dtm_path, low_res_path, width=profile['width'], height=profile['height'], resampleAlg='cubic')
 
-    # Generate CHM
     chm_path = os.path.join(project_dir, "chm.tif")
     ds_dsm = gdal.Open(dsm_path)
     ds_dtm = gdal.Open(dtm_path)
-    dsm_band = ds_dsm.GetRasterBand(1)
-    dtm_band = ds_dtm.GetRasterBand(1)
-    
-    chm_array = dsm_band.ReadAsArray() - dtm_band.ReadAsArray()
+    chm_array = ds_dsm.ReadAsArray() - ds_dtm.ReadAsArray()
     
     driver = gdal.GetDriverByName('GTiff')
     ds_chm = driver.Create(chm_path, ds_dsm.RasterXSize, ds_dsm.RasterYSize, 1, gdal.GDT_Float32)
     ds_chm.SetGeoTransform(ds_dsm.GetGeoTransform())
     ds_chm.SetProjection(ds_dsm.GetProjection())
-    chm_band = ds_chm.GetRasterBand(1)
-    chm_band.WriteArray(chm_array)
-    chm_band.FlushCache()
-    ds_dsm = ds_dtm = ds_chm = None # Close files
+    ds_chm.GetRasterBand(1).WriteArray(chm_array)
+    ds_chm.FlushCache()
+    ds_dsm = ds_dtm = ds_chm = None
 
     db = get_db()
-    update_project_status(db, project_id, "PROCESSING: SEGMENTING TREES", data={"chm_path": chm_path})
+    update_project_status(db, project_id, "PROCESSING: SEGMENTING TREES")
     db.close()
     
     return {"project_id": project_id, "chm_path": chm_path}
 
 @celery_app.task
 def segment_trees(previous_task_result: dict) -> dict:
-    """Segments trees from the CHM and saves them as polygons."""
     project_id = previous_task_result["project_id"]
     chm_path = previous_task_result["chm_path"]
     project_dir = os.path.dirname(chm_path)
+    print(f"[{project_id}] Starting tree segmentation...")
     
     with rasterio.open(chm_path) as src:
         chm = src.read(1)
@@ -145,16 +150,24 @@ def segment_trees(previous_task_result: dict) -> dict:
         crs = src.crs
     
     chm[chm < 1] = 0
-    chm_smooth = ndi.gaussian_filter(chm, sigma=1.5)
-    local_maxi = peak_local_max(chm_smooth, min_distance=3, labels=chm > 0)
-    markers = ndi.label(ndi.binary_fill_holes(local_maxi))[0]
-    labels = watershed(-chm_smooth, markers, mask=chm > 0)
+
+    scale_factor = 0.5 
+    chm_small = rescale(chm, scale_factor, anti_aliasing=True, preserve_range=True)
+    new_transform = transform * transform.scale(scale_factor)
+    
+    chm_smooth = ndi.gaussian_filter(chm_small, sigma=2)
+    local_max_coords = peak_local_max(chm_smooth, min_distance=3, labels=chm_small > 0, exclude_border=False)
+    
+    markers = np.zeros_like(chm_small, dtype=np.int32)
+    markers[tuple(local_max_coords.T)] = np.arange(len(local_max_coords)) + 1
+    
+    labels = watershed(-chm_smooth, markers, mask=chm_small > 0)
     
     polygons = []
     for label_id in np.unique(labels):
         if label_id == 0: continue
         mask_array = labels == label_id
-        shapes_gen = features.shapes(mask_array.astype(np.int16), mask=mask_array, transform=transform)
+        shapes_gen = features.shapes(mask_array.astype(np.int16), mask=mask_array, transform=new_transform)
         for geom, val in shapes_gen:
             if shape(geom).area > 2:
                 polygons.append({'geometry': shape(geom), 'label_id': label_id})
@@ -172,44 +185,62 @@ def segment_trees(previous_task_result: dict) -> dict:
 
 @celery_app.task
 def calculate_carbon(previous_task_result: dict) -> dict:
-    """Calculates final carbon sequestration values."""
     project_id = previous_task_result["project_id"]
     chm_path = previous_task_result["chm_path"]
     crowns_path = previous_task_result["crowns_path"]
     project_dir = os.path.dirname(chm_path)
+    print(f"[{project_id}] Starting carbon calculation...")
 
-    crowns_gdf = gpd.read_file(crowns_path)
-    chm_src = rasterio.open(chm_path)
-    
+    try:
+        crowns_gdf = gpd.read_file(crowns_path)
+        chm_src = rasterio.open(chm_path)
+    except Exception as e:
+        raise ValueError(f"Could not load files for calculation: {e}")
+
     tree_data = []
     for index, row in crowns_gdf.iterrows():
-        out_image, out_transform = mask.mask(chm_src, [row.geometry], crop=True, filled=False)
-        height = np.nanmax(out_image) if out_image.size > 0 and np.nanmax(out_image) > 0 else 0
-        tree_data.append({
-            'tree_id': row['label_id'],
-            'height_m': height,
-            'crown_area_sqm': row.geometry.area
-        })
-    df = pd.DataFrame(tree_data).query('height_m > 0')
+        try:
+            out_image, out_transform = mask.mask(chm_src, [row.geometry], crop=True, filled=False)
+            height = np.nanmax(out_image) if out_image.size > 0 and np.any(np.isfinite(out_image)) else 0
+            crown_area = row.geometry.area
+            tree_data.append({'tree_id': row['label_id'], 'height_m': height, 'crown_area_sqm': crown_area})
+        except Exception as e:
+            print(f"Error extracting metrics for tree {row['label_id']}: {e}")
+            continue
+    
+    chm_src.close()
+    
+    if not tree_data:
+        raise ValueError("No trees found after initial metric extraction.")
 
-    # Allometric equations
-    wood_density_rho, alpha_dbh, beta_h, gamma_ca = 0.65, 0.3, 1.2, 0.1
-    df['dbh_cm'] = alpha_dbh * (df['height_m'] ** beta_h) + (df['crown_area_sqm'] * gamma_ca)
-    df['agb_kg'] = 0.1 * (wood_density_rho * (df['dbh_cm'] ** 2.46))
-    df['total_biomass_kg'] = df['agb_kg'] * 1.5
-    df['carbon_kg'] = df['total_biomass_kg'] * 0.47
-    df['co2_sequestered_kg'] = df['carbon_kg'] * 3.67
+    df = pd.DataFrame(tree_data)
+    
+    print("\n--- Tree Dimension Statistics (Before Filtering) ---")
+    print(df[['height_m', 'crown_area_sqm']].describe())
+    print("----------------------------------------------------\n")
+    
+    df_filtered = df.query(
+        f"{MIN_REALISTIC_CROWN_AREA_SQM} <= crown_area_sqm <= {MAX_REALISTIC_CROWN_AREA_SQM} and "
+        f"{MIN_REALISTIC_TREE_HEIGHT_M} <= height_m <= {MAX_REALISTIC_TREE_HEIGHT_M}"
+    ).copy()
+    
+    if df_filtered.empty:
+        raise ValueError("No valid trees found after filtering. Adjust filter parameters if this is unexpected.")
+
+    df_filtered['estimated_dbh_cm'] = (DBH_FROM_HEIGHT_SLOPE * df_filtered['height_m']) + DBH_FROM_HEIGHT_INTERCEPT
+    df_filtered['agb_kg'] = ALLOM_COEFF_A * (WOOD_DENSITY_RHO * (df_filtered['estimated_dbh_cm'] ** ALLOM_COEFF_B))
+    df_filtered['total_biomass_kg'] = df_filtered['agb_kg'] * (1 + BGB_TO_AGB_RATIO)
+    df_filtered['carbon_kg'] = df_filtered['total_biomass_kg'] * CARBON_FRACTION
+    df_filtered['co2_sequestered_kg'] = df_filtered['carbon_kg'] * CO2_CONVERSION_FACTOR
 
     carbon_results_path = os.path.join(project_dir, "carbon_inventory.csv")
-    df.to_csv(carbon_results_path, index=False)
+    df_filtered.to_csv(carbon_results_path, index=False)
     
-    total_co2_tonnes = df['co2_sequestered_kg'].sum() / 1000
-
+    total_co2_tonnes = float(df_filtered['co2_sequestered_kg'].sum() / 1000)
+    
     db = get_db()
-    update_project_status(db, project_id, "COMPLETED", data={
-        "carbon_results_path": carbon_results_path,
-        "total_co2_tonnes": total_co2_tonnes
-    })
+    update_project_status(db, project_id, "COMPLETED", data={"carbon_results_path": carbon_results_path, "total_co2_tonnes": total_co2_tonnes})
     db.close()
 
+    print(f"[{project_id}] Calculation complete. Total CO2: {total_co2_tonnes:.2f} tonnes.")
     return {"project_id": project_id, "total_co2_tonnes": total_co2_tonnes}

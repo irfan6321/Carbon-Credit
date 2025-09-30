@@ -1,7 +1,8 @@
 # Web Framework & Server
 fastapi
 uvicorn[standard]
-
+python-multipart
+requests
 # Background Tasks
 celery
 redis
@@ -12,7 +13,7 @@ python-dotenv
 
 # Geospatial & Data Analysis
 # IMPORTANT: GDAL must be installed on the system inside the Docker container
-gdal
+gdal==3.10.3
 rasterio
 geopandas
 pandas
