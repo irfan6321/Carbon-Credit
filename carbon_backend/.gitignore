@@ -6,3 +6,6 @@ __pycache__/
 # Ignore the entire data directory and the database file
 data/
 carbon_project.db
+
+# macOS
+.DS_Store
