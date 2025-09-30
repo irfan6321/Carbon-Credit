@@ -1,11 +1,17 @@
-__pycache__/
-*.pyc
+# .gitignore (in the root of your Carbon-Credit repository)
+
+# General ignores
+.DS_Store
 .env
-.DS_Store
 
-# Ignore the entire data directory and the database file
-data/
-carbon_project.db
+# Python specific ignores
+*.pyc
+__pycache__/
 
-# macOS
-.DS_Store
+# Docker specific ignores
+*.log
+
+# Ignore generated data files within the carbon_backend project
+# This now targets the data folder inside 'carbon_backend'
+carbon_backend/data/
+carbon_backend/carbon_project.db
